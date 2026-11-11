@@ -1,0 +1,667 @@
+{
+  "name": "Entitlement Verification Gate",
+  "nodes": [
+    {
+      "id": "c4db0eb0-a110-5ea4-ba6e-bcc4e7213d2e",
+      "name": "Request in",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "entitlement-gate/request",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "webhookId": "9e6b0a3c-0336-5df5-8455-251c55bf65f3"
+    },
+    {
+      "id": "92b1eeb3-031d-5f46-922d-1e52824a3593",
+      "name": "Normalize request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Entitlement gate · normalize the request.\n// Accepts application/json or text/plain JSON. Only email, sku and request_id are read from the caller.\nconst crypto = require('crypto');\n\n// ---- Options ---------------------------------------------------------------\n// Fold Gmail aliases so jane.doe+promo@gmail.com and janedoe@gmail.com are one buyer.\n// Use the SAME setting in the purchase recorder, or lookups will miss.\nconst FOLD_GMAIL_ALIASES = true;\nconst GMAIL_DOMAINS = ['gmail.com', 'googlemail.com'];\n// ---------------------------------------------------------------------------\n\nconst hook = $('Request in').first().json || {};\nlet b = hook.body;\nif (typeof b === 'string') { try { b = JSON.parse(b); } catch (e) { b = {}; } }\nif (!b || typeof b !== 'object' || Array.isArray(b)) b = {};\n// text/plain bodies can arrive as { \"<json string>\": \"\" }\nconst keys = Object.keys(b);\nif (!b.email && keys.length === 1 && keys[0].trim().startsWith('{')) { try { b = JSON.parse(keys[0]); } catch (e) {} }\nconst hdr = hook.headers || {};\nconst s = (v) => (v === undefined || v === null) ? '' : String(v).trim();\n\nfunction canonicalEmail(email) {\n  const at = email.lastIndexOf('@');\n  if (at < 1) return email;\n  let local = email.slice(0, at);\n  let domain = email.slice(at + 1);\n  if (domain === 'googlemail.com') domain = 'gmail.com';\n  if (FOLD_GMAIL_ALIASES && GMAIL_DOMAINS.includes(domain)) local = local.split('+')[0].replace(/\\./g, '');\n  return local + '@' + domain;\n}\n\nconst typed = s(b.email).toLowerCase().slice(0, 254);\nconst valid = /^[^\\s@,;<>\"]+@[^\\s@,;<>\"]+\\.[^\\s@,;<>\"]+$/.test(typed);\nconst email = valid ? canonicalEmail(typed) : '';\nconst sku = s(b.sku || b.product).toLowerCase().replace(/[^a-z0-9_\\-]/g, '').slice(0, 64);\n\n// Idempotency: prefer the caller's Idempotency-Key header or body.request_id.\n// Otherwise derive one from email + sku, so double clicks and retries collapse into one request.\nlet requestId = s(hdr['idempotency-key'] || b.request_id).replace(/[^A-Za-z0-9_\\-:.]/g, '').slice(0, 128);\nif (!requestId) requestId = 'drv_' + crypto.createHash('sha256').update(email + '|' + sku).digest('hex').slice(0, 32);\n\nreturn [{ json: {\n  request_id: requestId,\n  email,\n  email_as_typed: typed,\n  valid_email: valid,\n  sku,\n  user_agent: s(hdr['user-agent']).slice(0, 300),\n  received_at: new Date().toISOString()\n} }];\n"
+      }
+    },
+    {
+      "id": "d7201337-8743-5aa6-a4b6-9b3b0278be84",
+      "name": "Seen this request?",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "processed_requests",
+          "cachedResultName": "processed_requests"
+        },
+        "returnAll": true,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "request_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Normalize request').first().json.request_id }}"
+            }
+          ]
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "056c4d44-4bb8-5cb2-a2df-4b74b797130d",
+      "name": "Already delivered?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "9a3ffba9-cf9c-501e-a737-47d16c60cb4e",
+              "leftValue": "={{ $('Seen this request?').all().some(i => i.json && i.json.decision === 'deliver') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "645a98e3-eb73-5275-aa00-20ce05d97b13",
+      "name": "Reply (duplicate)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, request_id: $('Normalize request').first().json.request_id, message: 'Thanks. If this matches an order, the product is on its way to the inbox on that order.' }) }}",
+        "options": {
+          "responseCode": "=202",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Content-Type-Options",
+                "value": "nosniff"
+              }
+            ]
+          }
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "f5f8f23e-ea11-554d-888b-e21cbe5929cf",
+      "name": "Find purchases",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        400
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "purchases",
+          "cachedResultName": "purchases"
+        },
+        "returnAll": true,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "email",
+              "condition": "eq",
+              "keyValue": "={{ $('Normalize request').first().json.email }}"
+            }
+          ]
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "7e7c4c5d-cf2b-5a65-af5b-e28a27c3d3c7",
+      "name": "Verify entitlement",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Entitlement gate · decide. Zero trust: only a purchase row in good standing for this exact email (and sku) passes.\nconst r = $('Normalize request').first().json;\nconst GOOD = ['paid', 'active', 'completed', 'fulfilled'];\nlet rows = [];\ntry { rows = $('Find purchases').all().map(i => i.json).filter(x => x && x.email); } catch (e) { rows = []; }\nconst mine = rows.filter(x => String(x.email).toLowerCase() === r.email);\nconst good = mine.filter(x => GOOD.includes(String(x.status || '').toLowerCase()));\nconst match = good.filter(x => !r.sku || String(x.sku || '').toLowerCase() === r.sku);\n\nlet reason = '';\nif (!r.valid_email) reason = 'invalid_email';\nelse if (!mine.length) reason = 'no_purchase_for_email';\nelse if (!good.length) reason = 'purchase_not_in_good_standing'; // refunded, disputed, cancelled, pending\nelse if (!match.length) reason = 'sku_not_purchased';\n\nconst verified = !reason;\nconst order = verified\n  ? match.slice().sort((a, b) => String(b.purchased_at || '').localeCompare(String(a.purchased_at || '')))[0]\n  : null;\n\nreturn [{ json: Object.assign({}, r, {\n  verified,\n  decision: verified ? 'deliver' : 'held',\n  reason: verified ? 'verified_purchase' : reason,\n  order_id: order ? String(order.order_id || '') : '',\n  // Ship to the address on the order, never to whatever was typed into a form.\n  deliver_to: order ? String(order.email) : '',\n  skus: verified ? [...new Set(match.map(x => String(x.sku || '')).filter(Boolean))] : []\n}) }];\n"
+      }
+    },
+    {
+      "id": "0546cc1d-8b2e-54fc-955f-14c1e0fc8df5",
+      "name": "Verified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "27d92716-5b8e-51ca-8391-09050053acdd",
+              "leftValue": "={{ $('Verify entitlement').first().json.verified }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "8005bbe8-7911-5998-b277-49a56d78260a",
+      "name": "Deliver (connect your delivery workflow)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {},
+      "executeOnce": true
+    },
+    {
+      "id": "c5928994-40ba-5848-a6d7-6e84b13b7909",
+      "name": "Hold for review",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1540,
+        520
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "held_requests",
+          "cachedResultName": "held_requests"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "request_id": "={{ $('Verify entitlement').first().json.request_id }}",
+            "email": "={{ $('Verify entitlement').first().json.email }}",
+            "email_as_typed": "={{ $('Verify entitlement').first().json.email_as_typed }}",
+            "sku": "={{ $('Verify entitlement').first().json.sku }}",
+            "reason": "={{ $('Verify entitlement').first().json.reason }}",
+            "status": "held",
+            "user_agent": "={{ $('Verify entitlement').first().json.user_agent }}",
+            "created_at": "={{ $('Verify entitlement').first().json.received_at }}"
+          },
+          "schema": [
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_as_typed",
+              "displayName": "email_as_typed",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sku",
+              "displayName": "sku",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reason",
+              "displayName": "reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "user_agent",
+              "displayName": "user_agent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "2ede7123-297c-5d26-9fc7-c5698247e49e",
+      "name": "Log decision",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        400
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "processed_requests",
+          "cachedResultName": "processed_requests"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "request_id": "={{ $('Verify entitlement').first().json.request_id }}",
+            "email": "={{ $('Verify entitlement').first().json.email }}",
+            "sku": "={{ $('Verify entitlement').first().json.sku }}",
+            "decision": "={{ $('Verify entitlement').first().json.decision }}",
+            "reason": "={{ $('Verify entitlement').first().json.reason }}",
+            "order_id": "={{ $('Verify entitlement').first().json.order_id }}",
+            "created_at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sku",
+              "displayName": "sku",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decision",
+              "displayName": "decision",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reason",
+              "displayName": "reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "order_id",
+              "displayName": "order_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "b5cbd1d1-f770-56b9-8cbf-27aecd0a9a80",
+      "name": "Reply (neutral)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1980,
+        400
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, request_id: $('Normalize request').first().json.request_id, message: 'Thanks. If this matches an order, the product is on its way to the inbox on that order.' }) }}",
+        "options": {
+          "responseCode": "=202",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Content-Type-Options",
+                "value": "nosniff"
+              }
+            ]
+          }
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "2e74653b-d0e4-51aa-b054-58a2ca6619ae",
+      "name": "Note: intake",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -40
+      ],
+      "parameters": {
+        "content": "## 1. Request in + normalize\nPOST `{ email, sku?, request_id? }` (JSON or text/plain JSON). An `Idempotency-Key` header also works.\n\nThe email is trimmed, lowercased and (optionally) Gmail-folded: dots and `+tags` removed, googlemail.com mapped to gmail.com. Turn it off with `FOLD_GMAIL_ALIASES = false`. Use the same rule wherever you write `purchases`.",
+        "color": 5,
+        "width": 520,
+        "height": 300
+      }
+    },
+    {
+      "id": "6ba510c1-7041-556d-8f5c-2b894717b177",
+      "name": "Note: idempotency",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        500,
+        -40
+      ],
+      "parameters": {
+        "content": "## 2. Idempotency\nEvery request has a `request_id`. If this id was already **delivered**, the gate replies with the same neutral message and stops. Nothing ships twice.\n\nA request that was **held** is checked again on retry, so it goes through once the order lands.",
+        "color": 4,
+        "width": 480,
+        "height": 300
+      }
+    },
+    {
+      "id": "bd16c88c-c039-5ab2-9078-58c3e1168e81",
+      "name": "Note: verify",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        620
+      ],
+      "parameters": {
+        "content": "## 3. Verify the entitlement\nLooks up `purchases` by the normalized email. Passes only when a row is in good standing (`paid`, `active`, `completed`, `fulfilled`) and matches the sku when one was sent. Refunded, disputed or cancelled orders never pass.\n\nThe product ships to the email **on the order**, not the one typed in the form.",
+        "color": 6,
+        "width": 520,
+        "height": 300
+      }
+    },
+    {
+      "id": "257a1e47-d8f3-59ab-9dd6-929d87733270",
+      "name": "Note: branches",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        -40
+      ],
+      "parameters": {
+        "content": "## 4. Deliver or hold\n**Deliver:** replace the NoOp with an Execute Workflow node that calls your delivery workflow. Pass `deliver_to`, `skus`, `order_id`, `request_id`.\n\n**Hold for review:** writes the request and the internal reason to `held_requests`. The caller never gets the product.\n\nBoth paths log to `processed_requests` (the audit trail) and return the **same** 202 reply, so the endpoint can't be used to check who bought what.",
+        "color": 3,
+        "width": 560,
+        "height": 320
+      }
+    }
+  ],
+  "connections": {
+    "Request in": {
+      "main": [
+        [
+          {
+            "node": "Normalize request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize request": {
+      "main": [
+        [
+          {
+            "node": "Seen this request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Seen this request?": {
+      "main": [
+        [
+          {
+            "node": "Already delivered?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already delivered?": {
+      "main": [
+        [
+          {
+            "node": "Reply (duplicate)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find purchases",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find purchases": {
+      "main": [
+        [
+          {
+            "node": "Verify entitlement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify entitlement": {
+      "main": [
+        [
+          {
+            "node": "Verified?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verified?": {
+      "main": [
+        [
+          {
+            "node": "Deliver (connect your delivery workflow)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Hold for review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver (connect your delivery workflow)": {
+      "main": [
+        [
+          {
+            "node": "Log decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hold for review": {
+      "main": [
+        [
+          {
+            "node": "Log decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log decision": {
+      "main": [
+        [
+          {
+            "node": "Reply (neutral)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false,
+    "saveDataSuccessExecution": "none"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "Zero-trust delivery gate: every request is matched to a verified purchase before anything ships."
+  },
+  "tags": []
+}

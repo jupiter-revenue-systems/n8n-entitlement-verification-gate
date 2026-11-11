@@ -1,0 +1,306 @@
+{
+  "name": "Entitlement Gate · Record purchase",
+  "nodes": [
+    {
+      "id": "dc2fa67f-b39f-5218-bf0c-bc3b1ab881f5",
+      "name": "Checkout webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "entitlement-gate/purchase",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "webhookId": "f6837057-4a9f-57e6-bb98-9aa843cd85cf"
+    },
+    {
+      "id": "7ef0f4a7-9625-515d-a52a-692c01086f75",
+      "name": "Check token and map",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Entitlement gate · record a purchase from your checkout's webhook.\n// 1) Checks a shared token header. 2) Maps the payload to the purchases columns.\nconst crypto = require('crypto');\n\n// ---- Settings --------------------------------------------------------------\n// Set a long random value here and send it from your checkout as the header x-webhook-token.\n// If your checkout signs payloads (HMAC), verify that signature here instead.\nconst WEBHOOK_TOKEN = 'replace-with-a-long-random-value';\nconst FOLD_GMAIL_ALIASES = true; // must match the gate\n// Map your checkout's statuses to: paid | refunded | disputed | cancelled | pending\nconst STATUS_MAP = { paid: 'paid', succeeded: 'paid', complete: 'paid', completed: 'paid', active: 'active',\n  refunded: 'refunded', refund: 'refunded', chargeback: 'disputed', disputed: 'disputed',\n  canceled: 'cancelled', cancelled: 'cancelled', pending: 'pending' };\n// ---------------------------------------------------------------------------\n\nconst hook = $('Checkout webhook').first().json || {};\nconst hdr = hook.headers || {};\nlet b = hook.body;\nif (typeof b === 'string') { try { b = JSON.parse(b); } catch (e) { b = {}; } }\nif (!b || typeof b !== 'object') b = {};\n\nconst sent = Buffer.from(String(hdr['x-webhook-token'] || ''));\nconst want = Buffer.from(WEBHOOK_TOKEN);\nconst tokenOk = WEBHOOK_TOKEN !== 'replace-with-a-long-random-value' && sent.length === want.length && crypto.timingSafeEqual(sent, want);\nif (!tokenOk) return [{ json: { ok: false } }];\n\nconst s = (v) => (v === undefined || v === null) ? '' : String(v).trim();\nconst get = (o, path) => path.split('.').reduce((a, k) => (a && a[k] !== undefined ? a[k] : undefined), o);\nconst first = (...paths) => { for (const p of paths) { const v = get(b, p); if (v !== undefined && v !== null && s(v) !== '') return s(v); } return ''; };\n\n// Common field locations. Add yours if your checkout uses different names.\nlet email = first('email', 'customer.email', 'customer_email', 'data.object.customer_details.email', 'contact.email', 'buyer.email').toLowerCase();\nconst at = email.lastIndexOf('@');\nif (at > 0) {\n  let local = email.slice(0, at), domain = email.slice(at + 1);\n  if (domain === 'googlemail.com') domain = 'gmail.com';\n  if (FOLD_GMAIL_ALIASES && domain === 'gmail.com') local = local.split('+')[0].replace(/\\./g, '');\n  email = local + '@' + domain;\n}\nconst sku = first('sku', 'product.sku', 'product_id', 'line_items.0.sku', 'data.object.metadata.sku', 'product.id').toLowerCase();\nconst orderId = first('order_id', 'id', 'order.id', 'data.object.id', 'transaction_id');\nconst rawStatus = first('status', 'payment_status', 'financial_status', 'data.object.payment_status', 'event').toLowerCase();\nconst status = STATUS_MAP[rawStatus] || 'pending';\nconst purchasedAt = first('purchased_at', 'created_at', 'order.created_at') || new Date().toISOString();\nconst valid = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) && !!orderId;\nreturn [{ json: { ok: valid, email, sku, order_id: orderId, status, purchased_at: purchasedAt } }];\n"
+      }
+    },
+    {
+      "id": "6d6e2eed-3144-5987-8036-289e61b9bcb5",
+      "name": "Valid purchase?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "7e6fba33-e829-51d3-9643-3ce721e87f22",
+              "leftValue": "={{ $('Check token and map').first().json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "9c4abbeb-34bc-58b7-980c-11274834fa2b",
+      "name": "Upsert purchase",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        200
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "purchases",
+          "cachedResultName": "purchases"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "order_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Check token and map').first().json.order_id }}"
+            },
+            {
+              "keyName": "sku",
+              "condition": "eq",
+              "keyValue": "={{ $('Check token and map').first().json.sku }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "email": "={{ $('Check token and map').first().json.email }}",
+            "sku": "={{ $('Check token and map').first().json.sku }}",
+            "order_id": "={{ $('Check token and map').first().json.order_id }}",
+            "status": "={{ $('Check token and map').first().json.status }}",
+            "purchased_at": "={{ $('Check token and map').first().json.purchased_at }}"
+          },
+          "schema": [
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sku",
+              "displayName": "sku",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "order_id",
+              "displayName": "order_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "purchased_at",
+              "displayName": "purchased_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "a4c8eb3d-8875-5888-8192-557767ca54f6",
+      "name": "Reply 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        200
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true }) }}",
+        "options": {
+          "responseCode": "=200",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Content-Type-Options",
+                "value": "nosniff"
+              }
+            ]
+          }
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "0b711d4c-9faf-5d39-9685-3f1807e030b0",
+      "name": "Reply 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        660,
+        420
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false }) }}",
+        "options": {
+          "responseCode": "=401",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Content-Type-Options",
+                "value": "nosniff"
+              }
+            ]
+          }
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "4c5d7255-3faf-5f29-8ed7-f22cbfdcea75",
+      "name": "Note: recorder",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        0
+      ],
+      "parameters": {
+        "content": "## Record purchase (optional helper)\nPoint your checkout's webhook here (POST). It checks the `x-webhook-token` header, maps the payload, and upserts one row per `order_id + sku` into `purchases`.\n\nA refund or dispute webhook for the same order flips `status`, and the gate stops delivering it.",
+        "color": 5,
+        "width": 600,
+        "height": 240
+      }
+    }
+  ],
+  "connections": {
+    "Checkout webhook": {
+      "main": [
+        [
+          {
+            "node": "Check token and map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check token and map": {
+      "main": [
+        [
+          {
+            "node": "Valid purchase?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid purchase?": {
+      "main": [
+        [
+          {
+            "node": "Upsert purchase",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert purchase": {
+      "main": [
+        [
+          {
+            "node": "Reply 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false,
+    "saveDataSuccessExecution": "none"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "Optional helper: writes verified purchases from any checkout webhook into the purchases table."
+  },
+  "tags": []
+}
