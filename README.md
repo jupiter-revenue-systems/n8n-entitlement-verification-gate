@@ -1,4 +1,4 @@
-<!-- HERO -->
+<p align="center"><img src="assets/hero.jpg" alt="Entitlement Verification Gate for n8n, by Ekai Stone" width="100%"></p>
 
 # Entitlement Verification Gate for n8n
 
